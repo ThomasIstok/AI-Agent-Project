@@ -1,192 +1,254 @@
 """
-app.py – Streamlit frontend pro Text-to-SQL Agent
-===================================================
-Webové rozhraní nahrazující terminálový while cyklus.
-Spuštění: streamlit run app.py
+Text-to-SQL Agent
+=================
+AI agent, který přeloží text dotaz do SQL pomocí Groq API (LLaMA),
+ověří jeho bezpečnost a spustí ho v lokální PostgreSQL databázi.
+
 """
 
-import streamlit as st
+import os
+import re
+import sys
+
 import pandas as pd
-
-from database import engine, test_connection, get_schema_ddl
-from llm import generate_sql
-from security import validate_sql
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+from groq import Groq
 
 
 # ──────────────────────────────────────────────
-# Konfigurace stránky
+# 1. Načtení přihlašovacích údajů (pouze do RAM)
 # ──────────────────────────────────────────────
 
-st.set_page_config(
-    page_title="AI Data Copilot",
-    page_icon="🤖",
-    layout="wide",
+load_dotenv()
+
+_db_user = os.getenv("DB_USER")
+_db_password = os.getenv("DB_PASSWORD")
+
+_db_host = os.getenv("DB_HOST")
+_db_port = os.getenv("DB_PORT")
+_db_name = os.getenv("DB_NAME")
+_groq_key = os.getenv("GROQ_API_KEY")
+
+# Kontrola, že všechny proměnné existují (bez výpisu hodnot!)
+_required = {
+    "DB_USER": _db_user,
+    "DB_PASSWORD": _db_password,
+    "DB_HOST": _db_host,
+    "DB_PORT": _db_port,
+    "DB_NAME": _db_name,
+    "GROQ_API_KEY": _groq_key,
+}
+
+_missing = [k for k, v in _required.items() if not v]
+if _missing:
+    print(f"❌ Chybí povinné proměnné v .env: {', '.join(_missing)}")
+    sys.exit(1)
+
+
+# ──────────────────────────────────────────────
+# 2. Připojení k databázi (SQLAlchemy + psycopg2)
+# ──────────────────────────────────────────────
+
+_connection_url = (
+    f"postgresql+psycopg2://{_db_user}:{_db_password}"
+    f"@{_db_host}:{_db_port}/{_db_name}"
 )
+engine = create_engine(_connection_url)
 
-# Custom CSS pro premium vzhled
-st.markdown("""
-<style>
-    /* Hlavní nadpis */
-    .main-title {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        font-size: 2.5rem;
-        font-weight: 800;
-        margin-bottom: 0;
-    }
-    .subtitle {
-        color: #888;
-        font-size: 1.1rem;
-        margin-top: -10px;
-    }
-    /* Metriky */
-    div[data-testid="stMetric"] {
-        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-        border: 1px solid #333;
-        border-radius: 12px;
-        padding: 15px;
-    }
-    /* Sidebar */
-    section[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #0f0f23 0%, #1a1a2e 100%);
-    }
-    /* SQL blok */
-    .sql-header {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        margin-bottom: 5px;
-    }
-</style>
-""", unsafe_allow_html=True)
+# Ověření připojení
+try:
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    print("✅ Připojení k databázi bylo úspěšné.\n")
+except Exception as e:
+    print(f"❌ Nepodařilo se připojit k databázi: {e}")
+    sys.exit(1)
 
 
 # ──────────────────────────────────────────────
-# Sidebar – stav připojení a schéma
+# 3. Konfigurace Groq API
 # ──────────────────────────────────────────────
 
-with st.sidebar:
-    st.markdown("## ⚙️ Stav systému")
-
-    # Test DB připojení
-    db_ok = test_connection()
-    if db_ok:
-        st.success("🐘 PostgreSQL – připojeno")
-    else:
-        st.error("🐘 PostgreSQL – nelze se připojit")
-
-    st.success("🤖 Groq API – nakonfigurováno")
-
-    st.divider()
-
-    # Zobrazení schématu
-    st.markdown("## 📋 Schéma databáze")
-    if db_ok:
-        with st.expander("Zobrazit strukturu tabulek", expanded=False):
-            ddl = get_schema_ddl()
-            st.code(ddl, language="sql")
-    else:
-        st.warning("Schéma nelze načíst – DB není dostupná.")
-
-    st.divider()
-    st.caption("🔒 Povoleny pouze SELECT dotazy")
-    st.caption("🛡️ SQL guardrails aktivní")
+client = Groq(api_key=_groq_key)
 
 
 # ──────────────────────────────────────────────
-# Hlavní oblast
+# 4. Pomocné funkce
 # ──────────────────────────────────────────────
 
-st.markdown('<p class="main-title">🤖 AI Data Copilot</p>', unsafe_allow_html=True)
-st.markdown('<p class="subtitle">Zeptej se databáze v přirozeném jazyce – AI přeloží do SQL a vrátí výsledky.</p>', unsafe_allow_html=True)
+def get_schema_ddl(eng) -> str:
+    """
+    Stáhne z databáze pouze DDL – seznam tabulek a jejich sloupců
+    z information_schema. NIKDY nestahuje samotná data.
+    """
+    query = text("""
+        SELECT table_name, column_name, data_type, is_nullable
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+        ORDER BY table_name, ordinal_position;
+    """)
+    with eng.connect() as conn:
+        rows = conn.execute(query).fetchall()
 
-st.markdown("")  # spacing
+    if not rows:
+        return "Databáze neobsahuje žádné tabulky ve schématu 'public'."
 
-# ── Vstupní pole ──
-user_query = st.text_input(
-    "💬 Tvůj dotaz:",
-    placeholder="Např.: Ukaž mi top 5 nejdražších produktů...",
-    label_visibility="visible",
-)
+    # Sestavení čitelného DDL popisu
+    ddl_lines: list[str] = []
+    current_table = None
+    for table_name, column_name, data_type, is_nullable in rows:
+        if table_name != current_table:
+            current_table = table_name
+            ddl_lines.append(f"\nTabulka: {table_name}")
+            ddl_lines.append("-" * (len(table_name) + 10))
+        nullable = "NULL" if is_nullable == "YES" else "NOT NULL"
+        ddl_lines.append(f"  {column_name}  {data_type}  {nullable}")
 
-# ── Tlačítko pro odeslání ──
-col1, col2, col3 = st.columns([1, 1, 4])
-with col1:
-    run_button = st.button("🚀 Spustit dotaz", type="primary", use_container_width=True)
-with col2:
-    show_schema = st.button("📋 Schéma", use_container_width=True)
+    return "\n".join(ddl_lines)
 
-# ── Zobrazení schématu v hlavní oblasti ──
-if show_schema:
-    if db_ok:
-        st.code(get_schema_ddl(), language="sql")
-    else:
-        st.error("Databáze není dostupná.")
 
-# ── Zpracování dotazu ──
-if run_button and user_query:
+def generate_sql(user_question: str, ddl_context: str) -> str:
+    """
+    Odešle dotaz a DDL kontext do Groq API (LLaMA model).
+    Systémový prompt přikazuje vrátit VÝHRADNĚ čistý SQL.
+    """
+    system_prompt = (
+        "Jsi SQL expert. Na základě následující struktury databáze "
+        "a uživatelova dotazu vygeneruj SQL dotaz.\n\n"
+        "PRAVIDLA:\n"
+        "1. Vrať VÝHRADNĚ čistý SQL dotaz.\n"
+        "2. Žádný markdown, žádné vysvětlování, žádné komentáře.\n"
+        "3. Dotaz MUSÍ začínat slovem SELECT.\n"
+        "4. Nepoužívej žádné destruktivní příkazy (DROP, DELETE, UPDATE, INSERT, ALTER, TRUNCATE).\n\n"
+        f"STRUKTURA DATABÁZE:\n{ddl_context}"
+    )
 
-    if not db_ok:
-        st.error("❌ Nelze se připojit k databázi. Zkontroluj PostgreSQL a .env soubor.")
-        st.stop()
+    response = client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_question},
+        ],
+        temperature=0.0,
+        max_tokens=1024,
+    )
 
-    # Načtení DDL pro kontext
-    ddl_context = get_schema_ddl()
+    # Vyčistit případné markdown backticks
+    sql = response.choices[0].message.content.strip()
+    sql = re.sub(r"^```(?:sql)?\s*", "", sql)
+    sql = re.sub(r"\s*```$", "", sql)
+    return sql.strip()
 
-    # 1. Generování SQL
-    with st.spinner("⏳ Generuji SQL dotaz z tvého textu..."):
+
+# ──────────────────────────────────────────────
+# 5. Bezpečnostní guardrails
+# ──────────────────────────────────────────────
+
+_FORBIDDEN_KEYWORDS = [
+    "DROP", "DELETE", "UPDATE", "INSERT",
+    "ALTER", "TRUNCATE", "GRANT", "REVOKE",
+    "EXEC", "EXECUTE", "CREATE", "--", "/*",
+]
+
+
+def validate_sql(sql: str) -> tuple[bool, str]:
+    """
+    Přísná validace SQL dotazu:
+    - Musí začínat slovem SELECT.
+    - Nesmí obsahovat zakázaná klíčová slova.
+    Vrací (je_bezpečný, důvod).
+    """
+    normalized = sql.upper().strip()
+
+    if not normalized.startswith("SELECT"):
+        return False, "Dotaz nezačíná slovem SELECT – zablokováno."
+
+    for keyword in _FORBIDDEN_KEYWORDS:
+        # Hledáme celá slova (word boundary) pro SQL klíčová slova,
+        # nebo přesný řetězec pro komentáře (-- a /*)
+        if keyword in ("--", "/*"):
+            if keyword in normalized:
+                return False, f"Dotaz obsahuje zakázaný vzor '{keyword}' – zablokováno."
+        else:
+            pattern = rf"\b{keyword}\b"
+            if re.search(pattern, normalized):
+                return False, f"Dotaz obsahuje zakázané klíčové slovo '{keyword}' – zablokováno."
+
+    return True, "OK"
+
+
+# ──────────────────────────────────────────────
+# 6. Hlavní smyčka
+# ──────────────────────────────────────────────
+
+def main():
+    print("=" * 55)
+    print("  🤖  Text-to-SQL Agent  (Groq + PostgreSQL)")
+    print("=" * 55)
+    print("Zadej svůj dotaz v přirozeném jazyce.")
+    print("Pro ukončení napiš: exit / quit / konec\n")
+
+    # Načtení DDL jednou na začátku (struktura se nemění často)
+    ddl_context = get_schema_ddl(engine)
+
+    while True:
         try:
-            generated_sql = generate_sql(user_query, ddl_context)
+            user_input = input("🗂️  Zeptej se databáze: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n\n👋 Ukončuji agenta. Nashledanou!")
+            break
+
+        if not user_input:
+            continue
+
+        if user_input.lower() in ("exit", "quit", "konec"):
+            print("\n👋 Ukončuji agenta. Nashledanou!")
+            break
+
+        # Speciální příkaz pro zobrazení struktury
+        if user_input.lower() in ("schema", "tabulky", "struktura"):
+            print("\n📋 Struktura databáze:")
+            print(ddl_context)
+            print()
+            continue
+
+        # ── Generování SQL ──
+        print("\n⏳ Generuji SQL dotaz...")
+        try:
+            generated_sql = generate_sql(user_input, ddl_context)
         except Exception as e:
-            st.error(f"❌ Chyba při komunikaci s Groq API: {e}")
-            st.stop()
+            print(f"❌ Chyba při komunikaci s Groq API: {e}\n")
+            continue
 
-    # 2. Zobrazení vygenerovaného SQL
-    st.markdown("### 📝 Vygenerovaný SQL")
-    st.code(generated_sql, language="sql")
+        print(f"📝 Vygenerovaný SQL:\n   {generated_sql}\n")
 
-    # 3. Bezpečnostní validace
-    is_safe, reason = validate_sql(generated_sql)
+        # ── Bezpečnostní kontrola ──
+        is_safe, reason = validate_sql(generated_sql)
+        if not is_safe:
+            print(f"🛑 BEZPEČNOSTNÍ BLOKACE: {reason}\n")
+            continue
 
-    if not is_safe:
-        st.error(f"🛑 **BEZPEČNOSTNÍ BLOKACE:** {reason}")
-        st.warning("Dotaz nebyl spuštěn. Zkus jinak formulovat svůj požadavek.")
-        st.stop()
-
-    st.success("✅ Bezpečnostní kontrola prošla")
-
-    # 4. Spuštění dotazu
-    with st.spinner("⚡ Spouštím dotaz v databázi..."):
+        # ── Spuštění dotazu ──
+        print("⚡ Spouštím dotaz...")
         try:
             df = pd.read_sql(generated_sql, engine)
+            if df.empty:
+                print("ℹ️  Dotaz nevrátil žádná data.\n")
+            else:
+                print(f"\n✅ Výsledek ({len(df)} řádků):\n")
+                # Nastavení pandas pro hezký výpis
+                with pd.option_context(
+                    "display.max_rows", 50,
+                    "display.max_columns", None,
+                    "display.width", None,
+                    "display.max_colwidth", 60,
+                ):
+                    print(df.to_string(index=False))
+                print()
         except Exception as e:
-            st.error(f"❌ Chyba při spuštění SQL dotazu: {e}")
-            st.stop()
+            print(f"❌ Chyba při spuštění SQL dotazu: {e}\n")
 
-    # 5. Zobrazení výsledků
-    if df.empty:
-        st.info("ℹ️ Dotaz nevrátil žádná data.")
-    else:
-        st.markdown(f"### ✅ Výsledek ({len(df)} řádků)")
 
-        # Metriky
-        col_a, col_b, col_c = st.columns(3)
-        col_a.metric("📊 Řádků", len(df))
-        col_b.metric("📋 Sloupců", len(df.columns))
-        col_c.metric("📐 Celkem buněk", len(df) * len(df.columns))
-
-        # Interaktivní tabulka
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-        # Stažení jako CSV
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="📥 Stáhnout jako CSV",
-            data=csv,
-            file_name="vysledek.csv",
-            mime="text/csv",
-        )
-
-elif run_button and not user_query:
-    st.warning("⚠️ Zadej prosím dotaz do textového pole.")
+if __name__ == "__main__":
+    main()
