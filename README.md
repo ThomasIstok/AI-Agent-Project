@@ -1,6 +1,6 @@
 # 🤖 AI Data Copilot – Text-to-SQL Agent
 
-Bezpečný AI agent, který přeloží tvůj dotaz v přirozeném jazyce do SQL,
+AI agent, který přeloží tvůj dotaz v přirozeném jazyce do SQL,
 spustí ho v lokální PostgreSQL databázi a vrátí výsledek jako interaktivní tabulku.
 
 Využívá **Groq API** (LLaMA model) pro generování SQL a **Streamlit** pro webové rozhraní.
