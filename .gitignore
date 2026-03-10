@@ -1,0 +1,21 @@
+# Přihlašovací údaje – NIKDY nenahrávat na GitHub
+.env
+
+# Virtuální prostředí
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS soubory
+.DS_Store
+Thumbs.db
