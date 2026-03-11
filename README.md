@@ -1,6 +1,6 @@
 # 🤖 AI Data Copilot – Text-to-SQL Agent
 
-AI agent, který přeloží tvůj dotaz v přirozeném jazyce do SQL,
+AI agent, který přeloží tvůj textový dotaz v jazyce do SQL,
 spustí ho v lokální PostgreSQL databázi a vrátí výsledek jako interaktivní tabulku.
 
 Využívá **Groq API** (LLaMA model) pro generování SQL a **Streamlit** pro webové rozhraní.
@@ -21,14 +21,14 @@ Tvůj dotaz (česky) → Groq AI → SQL dotaz → Bezpečnostní kontrola → P
 
 ```bash
 # 1. Klonuj repozitář
-git clone <url-repozitáře>
+git clone https://github.com/ThomasIstok/AI-Agent-Project
 cd Space
 
 # 2. Vytvoř virtuální prostředí
 python3 -m venv .venv
 source .venv/bin/activate
 
-# 3. Nainstaluj závislosti
+# 3. Nainstaluj requirements
 pip install -r requirements.txt
 
 # 4. Nastav přihlašovací údaje
